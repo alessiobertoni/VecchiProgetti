@@ -1,155 +1,233 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox
+import sys
 from collections import Counter
-import ttkbootstrap as ttk
-from ttkbootstrap.constants import *
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QTextEdit, QFileDialog, QMessageBox, QFrame, QLabel
+)
+from PySide6.QtGui import QFont, QColor, QTextCharFormat, QTextCursor
+from PySide6.QtCore import Qt
 
 ultimo_report = ""
 
 
-def analizza_file():
-    percorso = filedialog.askopenfilename(
-        title="Seleziona un file",
-        filetypes=[("Tutti i file", "*.*")]
-    )
+class AnalizzatoreWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Analizzatore di file di testo")
+        self.setMinimumSize(750, 600)
+        self.ultimo_report = ""
+        self._setup_ui()
+        self._apply_style()
 
-    if not percorso:
-        return
+    def _setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
 
-    try:
-        with open(percorso, "r", encoding="utf-8") as f:
-            righe = f.readlines()
-    except Exception as e:
-        messagebox.showerror("Errore", f"Impossibile leggere il file:\n{e}")
-        return
+        # Pulsanti
+        btn_frame = QHBoxLayout()
+        btn_frame.setSpacing(10)
 
-    # Chiedi il tipo di statistica
-    scelta = messagebox.askyesno(
-        "Tipo di statistica",
-        "Vuoi la statistica ESTESA?\n\n"
-        "Sì = tutte le righe\n"
-        "No = statistiche raggruppate"
-    )
+        self.btn_apri = QPushButton("Seleziona file")
+        self.btn_apri.setFixedHeight(36)
+        self.btn_apri.clicked.connect(self.analizza_file)
 
-    report = []
-    lunghezze = []
+        self.btn_salva = QPushButton("Salva report")
+        self.btn_salva.setFixedHeight(36)
+        self.btn_salva.clicked.connect(self.salva_report)
 
-    # Calcolo lunghezze
-    for i, riga in enumerate(righe, start=1):
-        num_caratteri = len(riga.rstrip("\n"))
-        lunghezze.append(num_caratteri)
+        btn_frame.addWidget(self.btn_apri)
+        btn_frame.addWidget(self.btn_salva)
+        btn_frame.addStretch()
+        layout.addLayout(btn_frame)
 
-        if scelta:  # Statistica estesa
-            report.append(f"Riga {i}: {num_caratteri} caratteri")
+        # Separatore
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(sep)
 
-    # Statistiche raggruppate
-    counter = Counter(lunghezze)
+        # Area testo output
+        self.text_output = QTextEdit()
+        self.text_output.setReadOnly(True)
+        self.text_output.setFont(QFont("Consolas", 10))
+        self.text_output.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(self.text_output)
 
-    # Lunghezza prevalente
-    lunghezza_prevalente = counter.most_common(1)[0][0]
-    righe_prevalenti = counter[lunghezza_prevalente]
+    def _apply_style(self):
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background-color: #1e1e2e;
+                color: #cdd6f4;
+            }
+            QPushButton {
+                background-color: #313244;
+                color: #cdd6f4;
+                border: 1px solid #45475a;
+                border-radius: 6px;
+                padding: 6px 20px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45475a;
+                border-color: #89b4fa;
+            }
+            QPushButton:pressed {
+                background-color: #89b4fa;
+                color: #1e1e2e;
+            }
+            QTextEdit {
+                background-color: #181825;
+                color: #cdd6f4;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                padding: 8px;
+                font-family: Consolas;
+                font-size: 10pt;
+            }
+            QFrame[frameShape="4"] {
+                color: #313244;
+            }
+            QScrollBar:vertical {
+                background: #181825;
+                width: 10px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical {
+                background: #45475a;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #89b4fa;
+            }
+            QScrollBar:horizontal {
+                background: #181825;
+                height: 10px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #45475a;
+                border-radius: 5px;
+            }
+        """)
+        # Colore pulsante Seleziona file (blu accent)
+        self.btn_apri.setStyleSheet(
+            self.btn_apri.styleSheet() +
+            "QPushButton { background-color: #89b4fa; color: #1e1e2e; border-color: #89b4fa; }"
+            "QPushButton:hover { background-color: #b4befe; }"
+            "QPushButton:pressed { background-color: #cba6f7; }"
+        )
+        # Colore pulsante Salva report (verde accent)
+        self.btn_salva.setStyleSheet(
+            self.btn_salva.styleSheet() +
+            "QPushButton { background-color: #a6e3a1; color: #1e1e2e; border-color: #a6e3a1; }"
+            "QPushButton:hover { background-color: #caf2c2; }"
+            "QPushButton:pressed { background-color: #94e2d5; }"
+        )
 
-    # Righe diverse
-    righe_diverse = len(lunghezze) - righe_prevalenti
+    def analizza_file(self):
+        percorso, _ = QFileDialog.getOpenFileName(
+            self, "Seleziona un file", "", "Tutti i file (*.*)"
+        )
+        if not percorso:
+            return
 
-    # Numeri delle righe diverse
-    righe_diverse_lista = [
-        i + 1 for i, lung in enumerate(lunghezze)
-        if lung != lunghezza_prevalente
-    ]
+        try:
+            with open(percorso, "r", encoding="utf-8") as f:
+                righe = f.readlines()
+        except Exception as e:
+            QMessageBox.critical(self, "Errore", f"Impossibile leggere il file:\n{e}")
+            return
 
-    report.append("\n--- Statistiche ---")
-    for lung, count in sorted(counter.items()):
-        report.append(f"{count} righe con {lung} caratteri")
+        # Chiedi tipo di statistica
+        risp = QMessageBox.question(
+            self, "Tipo di statistica",
+            "Vuoi la statistica ESTESA?\n\nSì = tutte le righe\nNo = statistiche raggruppate",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        scelta = (risp == QMessageBox.Yes)
 
-    report.append(
-        f"\nRighe diverse dal valore prevalente ({lunghezza_prevalente} caratteri): {righe_diverse}"
-    )
+        report = []
+        lunghezze = []
+        righe_anomale = set()  # numeri di riga (1-based) anomale
 
-    if righe_diverse_lista:
-        report.append("\nDettaglio righe diverse:")
-        for num_riga in righe_diverse_lista:
-            lung = lunghezze[num_riga - 1]
-            report.append(
-                f"Riga {num_riga}: con {lung} caratteri"
-            )
+        for i, riga in enumerate(righe, start=1):
+            num_caratteri = len(riga.rstrip("\n"))
+            lunghezze.append(num_caratteri)
+            if scelta:
+                report.append(f"Riga {i}: {num_caratteri} caratteri")
 
-    # Mostra il report con evidenziazione
-    text_output.config(state="normal")
-    text_output.delete("1.0", tk.END)
+        counter = Counter(lunghezze)
+        lunghezza_prevalente = counter.most_common(1)[0][0]
+        righe_prevalenti = counter[lunghezza_prevalente]
+        righe_diverse = len(lunghezze) - righe_prevalenti
+        righe_diverse_lista = [
+            i + 1 for i, lung in enumerate(lunghezze)
+            if lung != lunghezza_prevalente
+        ]
 
-    for line in report:
-        if "Riga" in line and "diversi" in line:
-            text_output.insert(tk.END, line + "\n", "anomala")
-        else:
-            text_output.insert(tk.END, line + "\n")
+        report.append("\n--- Statistiche ---")
+        for lung, count in sorted(counter.items()):
+            report.append(f"{count} righe con {lung} caratteri")
 
-    text_output.config(state="disabled")
+        report.append(
+            f"\nRighe diverse dal valore prevalente ({lunghezza_prevalente} caratteri): {righe_diverse}"
+        )
 
-    global ultimo_report
-    ultimo_report = "\n".join(report)
+        if righe_diverse_lista:
+            report.append("\nDettaglio righe diverse:")
+            for num_riga in righe_diverse_lista:
+                lung = lunghezze[num_riga - 1]
+                report.append(f"Riga {num_riga}: con {lung} caratteri")
+                righe_anomale.add(f"Riga {num_riga}: con {lung} caratteri")
+
+        # Scrittura nel text edit con evidenziazione righe anomale
+        self.text_output.clear()
+        cursor = self.text_output.textCursor()
+
+        fmt_normale = QTextCharFormat()
+        fmt_normale.setForeground(QColor("#cdd6f4"))
+        fmt_normale.setFontWeight(QFont.Normal)
+
+        fmt_anomala = QTextCharFormat()
+        fmt_anomala.setForeground(QColor("#f38ba8"))
+        fmt_anomala.setFontWeight(QFont.Bold)
+
+        for line in report:
+            fmt = fmt_anomala if line.strip() in righe_anomale else fmt_normale
+            cursor.insertText(line + "\n", fmt)
+
+        self.text_output.setTextCursor(cursor)
+        self.text_output.moveCursor(QTextCursor.Start)
+        self.ultimo_report = "\n".join(report)
+
+    def salva_report(self):
+        if not self.ultimo_report:
+            QMessageBox.warning(self, "Attenzione", "Non hai ancora generato un report.")
+            return
+
+        percorso, _ = QFileDialog.getSaveFileName(
+            self, "Salva report", "", "File di testo (*.txt)"
+        )
+        if not percorso:
+            return
+        if not percorso.endswith(".txt"):
+            percorso += ".txt"
+
+        try:
+            with open(percorso, "w", encoding="utf-8") as f:
+                f.write(self.ultimo_report)
+            QMessageBox.information(self, "Successo", "Report salvato correttamente.")
+        except Exception as e:
+            QMessageBox.critical(self, "Errore", f"Impossibile salvare il file:\n{e}")
 
 
-def salva_report():
-    if not ultimo_report:
-        messagebox.showwarning("Attenzione", "Non hai ancora generato un report.")
-        return
-
-    percorso = filedialog.asksaveasfilename(
-        title="Salva report",
-        defaultextension=".txt",
-        filetypes=[("File di testo", "*.txt")]
-    )
-
-    if not percorso:
-        return
-
-    try:
-        with open(percorso, "w", encoding="utf-8") as f:
-            f.write(ultimo_report)
-        messagebox.showinfo("Successo", "Report salvato correttamente.")
-    except Exception as e:
-        messagebox.showerror("Errore", f"Impossibile salvare il file:\n{e}")
-
-
-# GUI stile Windows 11
-root = ttk.Window(themename="cosmo")  # Tema moderno stile Win11
-root.title("Analizzatore di file di testo")
-root.geometry("750x600")
-
-frame = ttk.Frame(root, padding=10)
-frame.pack(fill="both", expand=True)
-
-# Pulsanti
-btn_frame = ttk.Frame(frame)
-btn_frame.pack(pady=10)
-
-btn_apri = ttk.Button(btn_frame, text="Seleziona file", bootstyle=PRIMARY, command=analizza_file)
-btn_apri.grid(row=0, column=0, padx=5)
-
-btn_salva = ttk.Button(btn_frame, text="Salva report", bootstyle=SUCCESS, command=salva_report)
-btn_salva.grid(row=0, column=1, padx=5)
-
-# Box testo + scrollbar
-text_frame = ttk.Frame(frame)
-text_frame.pack(fill="both", expand=True, pady=10)
-
-scrollbar = ttk.Scrollbar(text_frame, orient="vertical")
-scrollbar.pack(side="right", fill="y")
-
-text_output = tk.Text(
-    text_frame,
-    width=90,
-    height=30,
-    wrap="none",
-    yscrollcommand=scrollbar.set,
-    font=("Segoe UI", 10)
-)
-text_output.pack(side="left", fill="both", expand=True)
-
-scrollbar.config(command=text_output.yview)
-
-# Stile evidenziazione righe anomale
-text_output.tag_config("anomala", foreground="red", font=("Segoe UI", 10, "bold"))
-
-root.mainloop()
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = AnalizzatoreWindow()
+    window.show()
+    sys.exit(app.exec())
