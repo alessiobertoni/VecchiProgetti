@@ -1,152 +1,203 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
-from pdf2image import convert_from_path
-from pypdf import PdfReader, PdfWriter
 import json
 import os
+import sys
+from pathlib import Path
+from typing import Optional
 
-CONFIG_FILE = "config.json"
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap, QImage
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QFileDialog, QMessageBox,
+    QFormLayout, QFrame,
+)
 
-# ------------------ CONFIGURAZIONE POPPLER ------------------
+CONFIG_FILE = Path(__file__).parent / "config.json"
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
+
+# ---------------------------------------------------------------------------
+# Config Poppler
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
         try:
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
-        except:
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
             pass
     return {}
 
-def save_config(data):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(data, f, indent=4)
 
-def ask_poppler_path():
-    messagebox.showinfo(
+def save_config(data: dict):
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def ask_poppler_path(parent) -> Optional[str]:
+    QMessageBox.information(
+        parent,
         "Percorso Poppler",
-        "Seleziona la CARTELLA 'bin' di Poppler.\n\n"
-        "Esempio: C:/poppler/Library/bin"
+        "Seleziona la cartella 'bin' di Poppler.\n\nEsempio: C:/poppler/Library/bin",
     )
-
-    path = filedialog.askdirectory()
-
-    if path and os.path.exists(path):
-        # Verifica che contenga pdftoppm.exe
-        if not os.path.exists(os.path.join(path, "pdftoppm.exe")):
-            messagebox.showerror("Errore", "La cartella selezionata NON contiene pdftoppm.exe")
-            return None
-        return path
-
-    messagebox.showerror("Errore", "Percorso Poppler non valido.")
-    return None
+    path = QFileDialog.getExistingDirectory(parent, "Seleziona cartella bin di Poppler")
+    if not path:
+        QMessageBox.warning(parent, "Annullato", "Percorso Poppler non configurato.")
+        return None
+    if not os.path.exists(os.path.join(path, "pdftoppm.exe")):
+        QMessageBox.critical(parent, "Errore", "La cartella selezionata NON contiene pdftoppm.exe")
+        return None
+    return path
 
 
-# ------------------ GUI PRINCIPALE ------------------
+# ---------------------------------------------------------------------------
+# Finestra principale
+# ---------------------------------------------------------------------------
 
-class PdfSplitterGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("PDF Splitter con Anteprima")
+class PdfSplitterWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PDF Splitter con Anteprima")
+        self.setMinimumWidth(500)
 
-        self.config = load_config()
-        self.poppler_path = self.config.get("poppler_path")
+        self.pdf_path: Optional[str] = None
+        self.poppler_path: Optional[str] = None
 
-        # Se Poppler non è configurato, chiedilo all'utente
-        if not self.poppler_path or not os.path.exists(self.poppler_path):
-            self.poppler_path = ask_poppler_path()
-            if self.poppler_path:
-                self.config["poppler_path"] = self.poppler_path
-                save_config(self.config)
-            else:
-                raise Exception("Percorso Poppler non configurato!")
+        self._setup_poppler()
+        self._build_ui()
 
-        self.pdf_path = None
+    # ── Configurazione Poppler ───────────────────────────────────────────────
 
-        # Pulsante carica PDF
-        tk.Button(root, text="Carica PDF", command=self.load_pdf).pack(pady=5)
+    def _setup_poppler(self):
+        config = load_config()
+        path   = config.get("poppler_path")
 
-        # Area anteprima
-        self.preview_label = tk.Label(root, width=400, height=400, bg="lightgray")
-        self.preview_label.pack(pady=10)
-
-        # Campi input
-        tk.Label(root, text="Campo 1:").pack()
-        self.field1 = tk.Entry(root)
-        self.field1.pack()
-
-        tk.Label(root, text="Campo 2:").pack()
-        self.field2 = tk.Entry(root)
-        self.field2.pack()
-
-        # Pulsante split
-        tk.Button(root, text="Esegui Split", command=self.split_pdf).pack(pady=10)
-
-    # ------------------ CARICAMENTO PDF ------------------
-
-    def load_pdf(self):
-        self.pdf_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
-        if not self.pdf_path:
-            print("Nessun file selezionato.")
+        if path and os.path.exists(path):
+            self.poppler_path = path
             return
 
+        path = ask_poppler_path(self)
+        if not path:
+            QMessageBox.critical(self, "Errore", "Impossibile avviare senza Poppler.")
+            sys.exit(1)
+
+        self.poppler_path = path
+        config["poppler_path"] = path
+        save_config(config)
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(12)
+
+        # Pulsante carica
+        self.btn_load = QPushButton("Carica PDF")
+        self.btn_load.setMinimumHeight(34)
+        self.btn_load.clicked.connect(self.load_pdf)
+        lay.addWidget(self.btn_load)
+
+        # Anteprima
+        self.preview = QLabel("Nessun PDF caricato")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumSize(400, 400)
+        self.preview.setFrameShape(QFrame.StyledPanel)
+        self.preview.setStyleSheet("background:#e0e0e0; color:#555;")
+        lay.addWidget(self.preview)
+
+        # Campi input
+        form = QFormLayout()
+        self.field1 = QLineEdit()
+        self.field2 = QLineEdit()
+        self.field1.setPlaceholderText("es. Cliente")
+        self.field2.setPlaceholderText("es. 2024")
+        form.addRow("Campo 1:", self.field1)
+        form.addRow("Campo 2:", self.field2)
+        lay.addLayout(form)
+
+        # Pulsante split
+        self.btn_split = QPushButton("Esegui Split")
+        self.btn_split.setMinimumHeight(34)
+        self.btn_split.clicked.connect(self.split_pdf)
+        lay.addWidget(self.btn_split)
+
+    # ── Caricamento PDF ───────────────────────────────────────────────────────
+
+    def load_pdf(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Seleziona PDF", "", "PDF files (*.pdf)"
+        )
+        if not path:
+            return
+
+        self.pdf_path = path
+
         try:
+            from pdf2image import convert_from_path
             pages = convert_from_path(
-                self.pdf_path,
-                first_page=1,
-                last_page=1,
-                poppler_path=self.poppler_path
+                path, first_page=1, last_page=1,
+                poppler_path=self.poppler_path,
             )
-
             img = pages[0].convert("RGB")
-            print("Dimensione immagine:", img.size)
-
             img.thumbnail((400, 400))
-
             if img.width < 50 or img.height < 50:
                 img = img.resize((300, 300))
 
-            self.img_tk = ImageTk.PhotoImage(img)
-
-            self.preview_label.config(image=self.img_tk)
-            self.preview_label.image = self.img_tk
-
-            self.preview_label.update_idletasks()
-            print("Anteprima aggiornata.")
+            data = img.tobytes("raw", "RGB")
+            qi   = QImage(data, img.width, img.height, img.width * 3, QImage.Format_RGB888)
+            pm   = QPixmap.fromImage(qi)
+            self.preview.setPixmap(pm)
+            self.preview.setText("")
 
         except Exception as e:
-            print("ERRORE nel caricamento anteprima:", e)
+            QMessageBox.critical(self, "Errore anteprima", f"Impossibile caricare l'anteprima:\n{e}")
 
-    # ------------------ SPLIT PDF ------------------
+    # ── Split PDF ──────────────────────────────────────────────────────────────
 
     def split_pdf(self):
         if not self.pdf_path:
-            print("Carica prima un PDF.")
+            QMessageBox.warning(self, "Attenzione", "Carica prima un PDF.")
             return
 
-        f1 = self.field1.get().strip()
-        f2 = self.field2.get().strip()
+        f1 = self.field1.text().strip()
+        f2 = self.field2.text().strip()
 
         if not f1 or not f2:
-            print("Compila entrambi i campi!")
+            QMessageBox.warning(self, "Attenzione", "Compila entrambi i campi.")
             return
 
-        reader = PdfReader(self.pdf_path)
+        try:
+            from pypdf import PdfReader, PdfWriter
+            reader  = PdfReader(self.pdf_path)
+            out_dir = Path(self.pdf_path).parent
 
-        for i, page in enumerate(reader.pages):
-            writer = PdfWriter()
-            writer.add_page(page)
+            for i, page in enumerate(reader.pages):
+                writer = PdfWriter()
+                writer.add_page(page)
+                out_name = out_dir / f"{f1}_{f2}_pagina_{i + 1}.pdf"
+                with open(out_name, "wb") as fout:
+                    writer.write(fout)
 
-            output_filename = f"{f1}_{f2}_pagina_{i+1}.pdf"
+            QMessageBox.information(
+                self, "Completato",
+                f"Split completato!\n{len(reader.pages)} file salvati in:\n{out_dir}",
+            )
 
-            with open(output_filename, "wb") as out_file:
-                writer.write(out_file)
+        except Exception as e:
+            QMessageBox.critical(self, "Errore", f"Errore durante lo split:\n{e}")
 
-        print("Split completato!")
 
-# ------------------ AVVIO PROGRAMMA ------------------
+# ---------------------------------------------------------------------------
+# Avvio
+# ---------------------------------------------------------------------------
 
-root = tk.Tk()
-gui = PdfSplitterGUI(root)
-root.mainloop()
+def main():
+    app = QApplication(sys.argv)
+    window = PdfSplitterWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

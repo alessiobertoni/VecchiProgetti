@@ -1,36 +1,36 @@
 import os
+import sys
 import tempfile
-from tkinter import *
-from tkinter import filedialog, simpledialog, messagebox
-from PIL import Image, ImageTk
-from pdf2image import convert_from_path
+from pathlib import Path
+from typing import Optional
+
+from PySide6.QtCore import Qt, QRectF
+from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
+    QPushButton, QLabel, QScrollArea, QFileDialog, QMessageBox,
+    QDialog, QRadioButton, QButtonGroup, QDialogButtonBox,
+    QLineEdit, QFormLayout, QCheckBox, QFrame,
+)
+
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import red, blue, green, black
 from pypdf import PdfReader, PdfWriter
 
-# ---------------------------------------------------------
-# Conversioni mm <-> pt
-# ---------------------------------------------------------
-def mm_to_pt(mm):
+# ---------------------------------------------------------------------------
+# Conversioni
+# ---------------------------------------------------------------------------
+
+def mm_to_pt(mm: float) -> float:
     return mm * 2.83464567
 
-def pt_to_mm(pt):
+def pt_to_mm(pt: float) -> float:
     return pt / 2.83464567
 
-# ---------------------------------------------------------
-# Mappa colori
-# ---------------------------------------------------------
-COLOR_MAP = {
-    "rosso": red,
-    "blu": blue,
-    "verde": green,
-    "nero": black
-}
+COLOR_MAP = {"rosso": red, "blu": blue, "verde": green, "nero": black}
+COLOR_HEX = {"rosso": "#e63946", "blu": "#457b9d", "verde": "#2a9d8f", "nero": "#222222"}
 
-# ---------------------------------------------------------
-# Generatore etichette A, B, C, ..., Z, AA, AB, ...
-# ---------------------------------------------------------
-def index_to_label(index):
+def index_to_label(index: int) -> str:
     label = ""
     index += 1
     while index > 0:
@@ -38,729 +38,604 @@ def index_to_label(index):
         label = chr(65 + rem) + label
     return label
 
-# ---------------------------------------------------------
-# CLASSE PRINCIPALE
-# ---------------------------------------------------------
-class DimaWizardApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Dima PDF Wizard")
-        self.root.geometry("1200x700")
 
-        # PDF caricato
-        self.pdf_path = None
+# ---------------------------------------------------------------------------
+# Dialog: valore float con limite
+# ---------------------------------------------------------------------------
 
-        # Lista rettangoli
+class FloatDialog(QDialog):
+    def __init__(self, title: str, prompt: str, max_value: float, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.value: Optional[float] = None
+
+        form = QFormLayout(self)
+        form.setContentsMargins(16, 16, 16, 8)
+
+        self._lbl = QLabel(f"{prompt}\n(Max: {max_value:.1f} mm)")
+        self._lbl.setWordWrap(True)
+        form.addRow(self._lbl)
+
+        self._entry = QLineEdit()
+        self._entry.setPlaceholderText("0.0")
+        form.addRow("Valore (mm):", self._entry)
+
+        self._max = max_value
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_ok)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self._entry.setFocus()
+
+    def _on_ok(self):
+        try:
+            v = float(self._entry.text().replace(",", "."))
+        except ValueError:
+            QMessageBox.warning(self, "Errore", "Inserisci un numero valido.")
+            return
+        if v < 0:
+            QMessageBox.warning(self, "Errore", "Il valore non può essere negativo.")
+            return
+        if v > self._max:
+            QMessageBox.warning(self, "Errore", f"Massimo consentito: {self._max:.1f} mm")
+            return
+        self.value = v
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+# Dialog: scelta radio generica
+# ---------------------------------------------------------------------------
+
+class RadioDialog(QDialog):
+    def __init__(self, title: str, label: str, options: list[tuple[str, str]], parent=None):
+        """options: [(label, value), ...]"""
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.result_value: str = options[0][1]
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 8)
+        lay.addWidget(QLabel(label))
+
+        self._group = QButtonGroup(self)
+        for i, (lbl, val) in enumerate(options):
+            rb = QRadioButton(lbl)
+            rb.setProperty("val", val)
+            if i == 0:
+                rb.setChecked(True)
+            self._group.addButton(rb)
+            lay.addWidget(rb)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_ok)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _on_ok(self):
+        btn = self._group.checkedButton()
+        if btn:
+            self.result_value = btn.property("val")
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+# Dialog: posizione (lato + distanza)
+# ---------------------------------------------------------------------------
+
+class PositionDialog(QDialog):
+    def __init__(self, page_w_mm: float, page_h_mm: float, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Posizione del rettangolo")
+        self.result: Optional[dict] = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 8)
+
+        lay.addWidget(QLabel("Posizione verticale"))
+        self._rb_top    = QRadioButton("Distanza dall'alto");  self._rb_top.setChecked(True)
+        self._rb_bottom = QRadioButton("Distanza dal basso")
+        vg = QButtonGroup(self)
+        for rb in (self._rb_top, self._rb_bottom):
+            vg.addButton(rb); lay.addWidget(rb)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine); lay.addWidget(sep)
+
+        lay.addWidget(QLabel("Posizione orizzontale"))
+        self._rb_left  = QRadioButton("Distanza da sinistra"); self._rb_left.setChecked(True)
+        self._rb_right = QRadioButton("Distanza da destra")
+        hg = QButtonGroup(self)
+        for rb in (self._rb_left, self._rb_right):
+            hg.addButton(rb); lay.addWidget(rb)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_ok)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+        self._pw = page_w_mm
+        self._ph = page_h_mm
+        self._parent = parent
+
+    def _on_ok(self):
+        vert_side  = "top"  if self._rb_top.isChecked()  else "bottom"
+        horiz_side = "left" if self._rb_left.isChecked() else "right"
+
+        dlg_v = FloatDialog(
+            "Posizione verticale",
+            f"Distanza dall'{'alto' if vert_side == 'top' else 'basso'} (mm):",
+            self._ph, self._parent
+        )
+        if not dlg_v.exec() or dlg_v.value is None:
+            return
+
+        dlg_h = FloatDialog(
+            "Posizione orizzontale",
+            f"Distanza da{'sinistra' if horiz_side == 'left' else ' destra'} (mm):",
+            self._pw, self._parent
+        )
+        if not dlg_h.exec() or dlg_h.value is None:
+            return
+
+        self.result = {
+            "vert_side": vert_side, "vert_value": dlg_v.value,
+            "horiz_side": horiz_side, "horiz_value": dlg_h.value,
+        }
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+# Widget anteprima con zoom + pan
+# ---------------------------------------------------------------------------
+
+class PreviewCanvas(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.setMinimumSize(400, 400)
+        self._pixmap_orig: Optional[QPixmap] = None
+        self._zoom = 1.0
+        self._pan_start = None
+        self._offset_x = 0
+        self._offset_y = 0
+        self.setMouseTracking(True)
+
+    def set_pixmap(self, pm: QPixmap):
+        self._pixmap_orig = pm
+        self._offset_x = 0
+        self._offset_y = 0
+        self._redraw()
+
+    def _redraw(self):
+        if self._pixmap_orig is None:
+            return
+        w = int(self._pixmap_orig.width()  * self._zoom)
+        h = int(self._pixmap_orig.height() * self._zoom)
+        scaled = self._pixmap_orig.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        canvas = QPixmap(self.size())
+        canvas.fill(QColor("#e0e0e0"))
+        painter = QPainter(canvas)
+        painter.drawPixmap(self._offset_x, self._offset_y, scaled)
+        painter.end()
+        self.setPixmap(canvas)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        factor = 1.1 if delta > 0 else 1 / 1.1
+        self._zoom = max(0.2, min(5.0, self._zoom * factor))
+        self._redraw()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._pan_start = event.position().toPoint()
+
+    def mouseMoveEvent(self, event):
+        if self._pan_start is not None:
+            delta = event.position().toPoint() - self._pan_start
+            self._offset_x += delta.x()
+            self._offset_y += delta.y()
+            self._pan_start = event.position().toPoint()
+            self._redraw()
+
+    def mouseReleaseEvent(self, event):
+        self._pan_start = None
+
+    def resizeEvent(self, event):
+        self._redraw()
+
+
+# ---------------------------------------------------------------------------
+# App principale
+# ---------------------------------------------------------------------------
+
+class DimaWizardApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Dima PDF Wizard")
+        self.resize(1200, 700)
+
+        self.pdf_path: Optional[str] = None
+        self.rectangles: list[dict]  = []
+        self.next_index: int         = 0
+        self.debug_overlay: bool     = False
+        self.debug_points: list      = []
+        self.debug_rects: list       = []
+        self.current_image: Optional[QImage] = None
+
+        self._build_ui()
+
+    # ── Layout ──────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        # Anteprima
+        self._canvas = PreviewCanvas()
+        scroll = QScrollArea()
+        scroll.setWidget(self._canvas)
+        scroll.setWidgetResizable(True)
+        root.addWidget(scroll, 1)
+
+        # Controlli
+        ctrl = QWidget()
+        ctrl.setFixedWidth(260)
+        ctrl_lay = QVBoxLayout(ctrl)
+        ctrl_lay.setContentsMargins(10, 10, 10, 10)
+        ctrl_lay.setSpacing(10)
+
+        for text, slot in [
+            ("Carica PDF",           self.load_pdf),
+            ("Aggiungi rettangolo",  self.ask_add_rectangle),
+            ("Elimina rettangolo",   self.delete_rectangle),
+            ("Toggle Debug Overlay", self.toggle_debug),
+            ("Esporta PDF finale",   self.export_pdf),
+        ]:
+            btn = QPushButton(text)
+            btn.setMinimumHeight(34)
+            btn.clicked.connect(slot)
+            ctrl_lay.addWidget(btn)
+
+        ctrl_lay.addStretch()
+        root.addWidget(ctrl)
+
+    # ── Caricamento PDF ──────────────────────────────────────────────────────
+
+    def load_pdf(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Seleziona PDF", "", "PDF files (*.pdf)"
+        )
+        if not path:
+            return
+
+        self.pdf_path   = path
         self.rectangles = []
         self.next_index = 0
+        self.debug_points = []
+        self.debug_rects  = []
 
-        # Zoom e pan
-        self.zoom = 1.0
-        self.image_id = None
-        self.pan_start = None
-        self.current_image = None
+        reader = PdfReader(path)
+        page   = reader.pages[0]
+        pw_pt  = float(page.mediabox.width)
+        ph_pt  = float(page.mediabox.height)
 
-        # Overlay debug ON/OFF
-        self.debug_overlay = False
-        self.debug_points = []   # punti del testo
-        self.debug_rects = []    # rettangoli calcolati
+        # Rettangolo base = intera pagina
+        self.rectangles.append({
+            "label": index_to_label(0),
+            "width": pw_pt,  "height": ph_pt,
+            "width_mm": pt_to_mm(pw_pt), "height_mm": pt_to_mm(ph_pt),
+            "vert_side": "top",  "vert_value": 0, "vert_value_mm": 0,
+            "horiz_side": "left", "horiz_value": 0, "horiz_value_mm": 0,
+            "color": "nero", "text_position": "left", "fill_soft": False,
+        })
+        self.next_index = 1
 
-        # ---------------------------------------------------------
-        # AREA ANTEPRIMA
-        # ---------------------------------------------------------
-        self.preview_frame = Frame(root, bg="white")
-        self.preview_frame.pack(side=LEFT, fill=BOTH, expand=True)
+        self.debug_points = self._extract_text_positions(page)
+        self._update_preview()
+        self.ask_add_rectangle()
 
-        self.canvas = Canvas(self.preview_frame, bg="white")
-        self.canvas.pack(fill=BOTH, expand=True)
+    # ── Estrazione posizioni testo ────────────────────────────────────────────
 
-        # Zoom
-        self.canvas.bind("<MouseWheel>", self.on_zoom)
-        self.canvas.bind("<Button-4>", self.on_zoom)
-        self.canvas.bind("<Button-5>", self.on_zoom)
-
-        # Pan
-        self.canvas.bind("<ButtonPress-1>", self.start_pan)
-        self.canvas.bind("<B1-Motion>", self.do_pan)
-
-        # ---------------------------------------------------------
-        # AREA CONTROLLI
-        # ---------------------------------------------------------
-        self.controls = Frame(root, width=300, padx=10, pady=10)
-        self.controls.pack(side=RIGHT, fill=Y)
-
-        Button(self.controls, text="Carica PDF", width=20, command=self.load_pdf).pack(pady=10)
-        Button(self.controls, text="Aggiungi rettangolo", width=20, command=self.ask_add_rectangle).pack(pady=10)
-        Button(self.controls, text="Elimina rettangolo", width=20, command=self.delete_rectangle).pack(pady=10)
-        Button(self.controls, text="Esporta PDF finale", width=20, command=self.export_pdf).pack(pady=20)
-
-        # 🔥 Pulsante overlay debug
-        Button(self.controls, text="Toggle Debug Overlay", width=20, command=self.toggle_debug).pack(pady=20)
-            # ---------------------------------------------------------
-    # ESTRAZIONE POSIZIONI TESTO (pypdf)
-    # ---------------------------------------------------------
-    def extract_text_positions(self, page):
+    def _extract_text_positions(self, page) -> list:
         items = []
 
         def visitor(text, cm, tm, font_dict, font_size):
-            # Matrice completa: posizione reale del testo
             real_x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
             real_y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
-
-            # Larghezza approssimata del testo (funziona molto bene)
-            # 0.5 * font_size ≈ larghezza media di un carattere
-            text_width = len(text) * font_size * 0.5
-
-            # Altezza del testo
-            text_height = font_size
-
             items.append({
-                "text": text,
-                "x": real_x,
-                "y": real_y,
-                "w": text_width,
-                "h": text_height
+                "text": text, "x": real_x, "y": real_y,
+                "w": len(text) * font_size * 0.5, "h": font_size,
             })
 
         page.extract_text(visitor_text=visitor)
         return items
-    # ---------------------------------------------------------
-    # COORDINATE UNIFICATE (disegno + detection)
-    # ---------------------------------------------------------
-    def get_rect_pdf_coords(self, rect, page_width, page_height):
-        # Y
-        if rect["vert_side"] == "top":
-            y = page_height - rect["vert_value"] - rect["height"]
-        else:
-            y = rect["vert_value"]
 
-        # X
-        if rect["horiz_side"] == "left":
-            x = rect["horiz_value"]
-        else:
-            x = page_width - rect["horiz_value"] - rect["width"]
+    # ── Coordinate rettangolo in PDF ──────────────────────────────────────────
 
+    def _get_rect_pdf_coords(self, rect: dict, page_w: float, page_h: float):
+        y = (page_h - rect["vert_value"]  - rect["height"]) if rect["vert_side"]  == "top"  else rect["vert_value"]
+        x = rect["horiz_value"] if rect["horiz_side"] == "left" else (page_w - rect["horiz_value"] - rect["width"])
         return x, y
 
-    # ---------------------------------------------------------
-    # DETECTION TESTO (con tolleranza migliorata)
-    # ---------------------------------------------------------
-    def rectangle_contains_text(self, rect, text_items, page_height, page_width):
-        x, y = self.get_rect_pdf_coords(rect, page_width, page_height)
+    # ── Detection testo ───────────────────────────────────────────────────────
 
-        rect_left = x
-        rect_right = x + rect["width"]
-        rect_bottom = y
-        rect_top = y + rect["height"]
-
-        tol = 2.0  # tolleranza
-
-        found = False
-        self.debug_points = []
-
+    def _rectangle_contains_text(self, rect: dict, text_items: list, pw: float, ph: float) -> bool:
+        x, y = self._get_rect_pdf_coords(rect, pw, ph)
+        tol  = 2.0
         for t in text_items:
-            tx = t["x"]
-            ty = t["y"]
-            tw = t["w"]
-            th = t["h"]
-
-            # Bounding box del testo
-            text_left = tx
-            text_right = tx + tw
-            text_bottom = ty
-            text_top = ty + th
-
-            # Salva punto debug
-            self.debug_points.append((tx, ty))
-
-            # Controllo sovrapposizione rettangolo <-> testo
             overlap = not (
-                text_right < rect_left - tol or
-                text_left > rect_right + tol or
-                text_top < rect_bottom - tol or
-                text_bottom > rect_top + tol
+                t["x"] + t["w"] < x - tol or t["x"] > x + rect["width"]  + tol or
+                t["y"] + t["h"] < y - tol or t["y"] > y + rect["height"] + tol
             )
-
             if overlap:
-                found = True
+                return True
+        return False
 
-        return found
+    # ── Wizard: aggiungi rettangolo ───────────────────────────────────────────
 
-    # ---------------------------------------------------------
-    # PATTERN PUNTINATO (compatibile con tutte le versioni)
-    # ---------------------------------------------------------
-    def draw_dotted_pattern(self, c, x, y, w, h, color):
-        c.saveState()
-        c.setFillColor(color)
-
-        step = 6       # distanza tra puntini
-        dot_size = 1 # raggio puntino
-
-        xx = x
-        while xx < x + w:
-            yy = y
-            while yy < y + h:
-                c.circle(xx, yy, dot_size, fill=1, stroke=0)
-                yy += step
-            xx += step
-
-        c.restoreState()
-            # ---------------------------------------------------------
-    # OVERLAY DEBUG: disegna punti del testo e rettangoli calcolati
-    # ---------------------------------------------------------
-    def draw_debug_overlay(self):
-        if not self.debug_overlay:
-            return
-
-        # Cancella overlay precedente
-        self.canvas.delete("debug")
-
-        # Disegna punti del testo
-        for (tx, ty) in self.debug_points:
-            # Applica zoom
-            zx = tx * self.zoom
-            zy = ty * self.zoom
-            r = 3
-            self.canvas.create_oval(
-                zx - r, zy - r, zx + r, zy + r,
-                fill="red", outline="", tags="debug"
-            )
-
-        # Disegna rettangoli calcolati
-        for rect in self.debug_rects:
-            x, y, w, h = rect
-            zx = x * self.zoom
-            zy = y * self.zoom
-            zw = w * self.zoom
-            zh = h * self.zoom
-
-            self.canvas.create_rectangle(
-                zx, zy, zx + zw, zy + zh,
-                outline="blue", width=2, tags="debug"
-            )
-
-    # ---------------------------------------------------------
-    # TOGGLE OVERLAY DEBUG
-    # ---------------------------------------------------------
-    def toggle_debug(self):
-        self.debug_overlay = not self.debug_overlay
-        self.update_preview()
-            # ---------------------------------------------------------
-    # CARICA PDF
-    # ---------------------------------------------------------
-    def load_pdf(self):
-        self.pdf_path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
-        if not self.pdf_path:
-            return
-
-        # Reset stato
-        self.rectangles = []
-        self.next_index = 0
-        self.zoom = 1.0
-        self.debug_points = []
-        self.debug_rects = []
-
-        reader = PdfReader(self.pdf_path)
-        page = reader.pages[0]
-
-        page_width_pt = float(page.mediabox.width)
-        page_height_pt = float(page.mediabox.height)
-
-        page_width_mm = pt_to_mm(page_width_pt)
-        page_height_mm = pt_to_mm(page_height_pt)
-
-        # Rettangolo base (pagina intera)
-        label = index_to_label(self.next_index)
-
-        self.rectangles.append({
-            "label": label,
-            "width": page_width_pt,
-            "height": page_height_pt,
-            "width_mm": page_width_mm,
-            "height_mm": page_height_mm,
-            "vert_side": "top",
-            "vert_value": 0,
-            "vert_value_mm": 0,
-            "horiz_side": "left",
-            "horiz_value": 0,
-            "horiz_value_mm": 0,
-            "color": "nero",
-            "text_position": "left",
-            "fill_soft": False
-        })
-
-        self.next_index += 1
-
-        # Estrai punti testo per overlay debug
-        self.debug_points = self.extract_text_positions(page)
-
-        self.update_preview()
-        self.ask_add_rectangle()
-
-    # ---------------------------------------------------------
-    # WIZARD AGGIUNTA RETTANGOLO
-    # ---------------------------------------------------------
     def ask_add_rectangle(self):
         if not self.pdf_path:
-            messagebox.showwarning("Attenzione", "Carica prima un PDF.")
+            QMessageBox.warning(self, "Attenzione", "Carica prima un PDF.")
+            return
+        if QMessageBox.question(
+            self, "Aggiungi rettangolo", "Vuoi aggiungere un rettangolo?",
+            QMessageBox.Yes | QMessageBox.No
+        ) != QMessageBox.Yes:
             return
 
-        risposta = messagebox.askyesno("Aggiungi rettangolo", "Vuoi aggiungere un rettangolo?")
-        if not risposta:
+        reader  = PdfReader(self.pdf_path)
+        page    = reader.pages[0]
+        pw_mm   = pt_to_mm(float(page.mediabox.width))
+        ph_mm   = pt_to_mm(float(page.mediabox.height))
+
+        # Larghezza
+        dlg = FloatDialog("Dimensioni", "Larghezza del rettangolo (mm):", pw_mm, self)
+        if not dlg.exec() or dlg.value is None:
             return
+        w_mm = dlg.value
 
-        reader = PdfReader(self.pdf_path)
-        page = reader.pages[0]
+        # Altezza
+        dlg = FloatDialog("Dimensioni", "Altezza del rettangolo (mm):", ph_mm, self)
+        if not dlg.exec() or dlg.value is None:
+            return
+        h_mm = dlg.value
 
-        page_width_mm = pt_to_mm(float(page.mediabox.width))
-        page_height_mm = pt_to_mm(float(page.mediabox.height))
+        # Posizione
+        pos_dlg = PositionDialog(pw_mm, ph_mm, self)
+        if not pos_dlg.exec() or pos_dlg.result is None:
+            return
+        pos = pos_dlg.result
 
-        # --- Dimensioni ---
-        larghezza_mm = self.ask_limited_float(
-            "Dimensioni",
-            "Larghezza del rettangolo (mm):",
-            page_width_mm
+        # Colore
+        col_dlg = RadioDialog(
+            "Colore del rettangolo", "Scegli il colore:",
+            [("Rosso", "rosso"), ("Blu", "blu"), ("Verde", "verde")], self
         )
-        if larghezza_mm is None:
+        if not col_dlg.exec():
             return
+        colore = col_dlg.result_value
 
-        altezza_mm = self.ask_limited_float(
-            "Dimensioni",
-            "Altezza del rettangolo (mm):",
-            page_height_mm
+        # Posizione testo
+        tp_dlg = RadioDialog(
+            "Posizione del testo", "Dove vuoi posizionare la scritta?",
+            [("A sinistra", "left"), ("A destra", "right")], self
         )
-        if altezza_mm is None:
+        if not tp_dlg.exec():
             return
-
-        # --- Posizione ---
-        pos = self.ask_position(page_width_mm, page_height_mm)
-        if pos is None:
-            return
-
-        # --- Colore ---
-        colore = self.ask_color()
-
-        # --- Posizione testo ---
-        text_pos = self.ask_text_position()
+        text_pos = tp_dlg.result_value
 
         label = index_to_label(self.next_index)
-
         new_rect = {
             "label": label,
-            "width": mm_to_pt(larghezza_mm),
-            "height": mm_to_pt(altezza_mm),
-            "width_mm": larghezza_mm,
-            "height_mm": altezza_mm,
-            "vert_side": pos["vert_side"],
-            "vert_value": mm_to_pt(pos["vert_value"]),
+            "width": mm_to_pt(w_mm),  "height": mm_to_pt(h_mm),
+            "width_mm": w_mm,          "height_mm": h_mm,
+            "vert_side":  pos["vert_side"],  "vert_value":  mm_to_pt(pos["vert_value"]),
             "vert_value_mm": pos["vert_value"],
-            "horiz_side": pos["horiz_side"],
-            "horiz_value": mm_to_pt(pos["horiz_value"]),
+            "horiz_side": pos["horiz_side"], "horiz_value": mm_to_pt(pos["horiz_value"]),
             "horiz_value_mm": pos["horiz_value"],
-            "color": colore,
-            "text_position": text_pos,
-            "fill_soft": False
+            "color": colore, "text_position": text_pos, "fill_soft": False,
         }
+
+        # Rilevamento testo
+        text_items = self._extract_text_positions(page)
+        contains = self._rectangle_contains_text(
+            new_rect, text_items,
+            float(page.mediabox.width), float(page.mediabox.height)
+        )
+        if contains and QMessageBox.question(
+            self, "Testo rilevato",
+            "In quest'area è presente del testo.\nVuoi evidenziarlo?",
+            QMessageBox.Yes | QMessageBox.No
+        ) == QMessageBox.Yes:
+            new_rect["fill_soft"] = True
 
         self.rectangles.append(new_rect)
         self.next_index += 1
 
-        # --- Rilevamento testo ---
-        text_items = self.extract_text_positions(page)
-
-        contains_text = self.rectangle_contains_text(
-            new_rect,
-            text_items,
-            float(page.mediabox.height),
-            float(page.mediabox.width)
-        )
-
-        if contains_text:
-            risposta = messagebox.askyesno(
-                "Testo rilevato",
-                "In quest'area è presente del testo.\nVuoi evidenziarlo?"
-            )
-            if risposta:
-                new_rect["fill_soft"] = True
-
-        # Salva rettangolo per overlay debug
-        x, y = self.get_rect_pdf_coords(
-            new_rect,
-            float(page.mediabox.width),
-            float(page.mediabox.height)
+        # Aggiorna debug_rects
+        x, y = self._get_rect_pdf_coords(
+            new_rect, float(page.mediabox.width), float(page.mediabox.height)
         )
         self.debug_rects.append((x, y, new_rect["width"], new_rect["height"]))
 
-        self.update_preview()
+        self._update_preview()
         self.ask_add_rectangle()
-            # ---------------------------------------------------------
-    # FINESTRA POSIZIONE (corretta per Windows 11)
-    # ---------------------------------------------------------
-    def ask_position(self, page_width_mm, page_height_mm):
-        win = Toplevel(self.root)
-        win.title("Posizione del rettangolo")
-        win.geometry("300x250")
 
-        # --- Fix definitivo per finestre dietro ---
-        win.transient(self.root)
-        win.grab_set()
-        win.after(10, win.lift)
-        win.after(10, lambda: win.attributes("-topmost", True))
-        win.after(200, lambda: win.attributes("-topmost", False))
+    # ── Elimina rettangolo ───────────────────────────────────────────────────
 
-        vert_choice = StringVar(value="top")
-        horiz_choice = StringVar(value="left")
-
-        Label(win, text="Posizione verticale").pack(pady=5)
-        Radiobutton(win, text="Distanza dall'alto", variable=vert_choice, value="top").pack()
-        Radiobutton(win, text="Distanza dal basso", variable=vert_choice, value="bottom").pack()
-
-        Label(win, text="Posizione orizzontale").pack(pady=10)
-        Radiobutton(win, text="Distanza da sinistra", variable=horiz_choice, value="left").pack()
-        Radiobutton(win, text="Distanza da destra", variable=horiz_choice, value="right").pack()
-
-        result = {}
-
-        def confirm():
-            result["vert_side"] = vert_choice.get()
-            result["horiz_side"] = horiz_choice.get()
-            win.destroy()
-
-        Button(win, text="Conferma", command=confirm).pack(pady=15)
-        win.wait_window()
-
-        if not result:
-            return None
-
-        # --- Valore verticale ---
-        if result["vert_side"] == "top":
-            vert_prompt = "Distanza dall'alto (mm):"
-            vert_max = page_height_mm
-        else:
-            vert_prompt = "Distanza dal basso (mm):"
-            vert_max = page_height_mm
-
-        vert_value_mm = self.ask_limited_float(
-            "Posizione verticale",
-            vert_prompt,
-            vert_max
-        )
-        if vert_value_mm is None:
-            return None
-
-        # --- Valore orizzontale ---
-        if result["horiz_side"] == "left":
-            horiz_prompt = "Distanza da sinistra (mm):"
-            horiz_max = page_width_mm
-        else:
-            horiz_prompt = "Distanza da destra (mm):"
-            horiz_max = page_width_mm
-
-        horiz_value_mm = self.ask_limited_float(
-            "Posizione orizzontale",
-            horiz_prompt,
-            horiz_max
-        )
-        if horiz_value_mm is None:
-            return None
-
-        result["vert_value"] = vert_value_mm
-        result["horiz_value"] = horiz_value_mm
-        return result
-    # ---------------------------------------------------------
-    # INPUT CON LIMITE (mm)
-    # ---------------------------------------------------------
-    def ask_limited_float(self, title, prompt_base, max_value_mm):
-        win = Toplevel(self.root)
-        win.title(title)
-        win.geometry("300x150")
-
-        # Fix finestre dietro
-        win.transient(self.root)
-        win.grab_set()
-        win.after(10, win.lift)
-        win.after(10, lambda: win.attributes("-topmost", True))
-        win.after(200, lambda: win.attributes("-topmost", False))
-
-        Label(win, text=f"{prompt_base}\n(Max: {max_value_mm:.1f} mm)").pack(pady=10)
-
-        value_var = StringVar()
-        entry = Entry(win, textvariable=value_var)
-        entry.pack(pady=5)
-        entry.focus()
-
-        result = {"value": None}
-
-        def confirm():
-            try:
-                v = float(value_var.get())
-                if v < 0:
-                    messagebox.showerror("Valore non valido", "Il valore non può essere negativo.")
-                    return
-                if v > max_value_mm:
-                    messagebox.showerror("Valore troppo grande", f"Massimo: {max_value_mm:.1f} mm")
-                    return
-                result["value"] = v
-                win.destroy()
-            except:
-                messagebox.showerror("Errore", "Inserisci un numero valido.")
-
-        Button(win, text="OK", command=confirm).pack(pady=10)
-        win.wait_window()
-
-        return result["value"]
-    # ---------------------------------------------------------
-    # FINESTRA COLORE (corretta per Windows 11)
-    # ---------------------------------------------------------
-    def ask_color(self):
-        win = Toplevel(self.root)
-        win.title("Colore del rettangolo")
-        win.geometry("250x150")
-
-        # --- Fix definitivo ---
-        win.transient(self.root)
-        win.grab_set()
-        win.after(10, win.lift)
-        win.after(10, lambda: win.attributes("-topmost", True))
-        win.after(200, lambda: win.attributes("-topmost", False))
-
-        color_choice = StringVar(value="rosso")
-
-        Label(win, text="Scegli il colore").pack(pady=5)
-        Radiobutton(win, text="Rosso", variable=color_choice, value="rosso").pack()
-        Radiobutton(win, text="Blu", variable=color_choice, value="blu").pack()
-        Radiobutton(win, text="Verde", variable=color_choice, value="verde").pack()
-
-        def confirm():
-            win.destroy()
-
-        Button(win, text="Conferma", command=confirm).pack(pady=10)
-        win.wait_window()
-        return color_choice.get()
-
-    # ---------------------------------------------------------
-    # FINESTRA POSIZIONE TESTO (corretta per Windows 11)
-    # ---------------------------------------------------------
-    def ask_text_position(self):
-        win = Toplevel(self.root)
-        win.title("Posizione del testo")
-        win.geometry("250x150")
-
-        # --- Fix definitivo ---
-        win.transient(self.root)
-        win.grab_set()
-        win.after(10, win.lift)
-        win.after(10, lambda: win.attributes("-topmost", True))
-        win.after(200, lambda: win.attributes("-topmost", False))
-
-        choice = StringVar(value="left")
-
-        Label(win, text="Dove vuoi posizionare la scritta?").pack(pady=5)
-        Radiobutton(win, text="A sinistra", variable=choice, value="left").pack()
-        Radiobutton(win, text="A destra", variable=choice, value="right").pack()
-
-        def confirm():
-            win.destroy()
-
-        Button(win, text="Conferma", command=confirm).pack(pady=10)
-        win.wait_window()
-        return choice.get()
-            # ---------------------------------------------------------
-    # ELIMINA RETTANGOLO
-    # ---------------------------------------------------------
     def delete_rectangle(self):
         if not self.rectangles:
-            messagebox.showinfo("Nessun rettangolo", "Non ci sono rettangoli da eliminare.")
+            QMessageBox.information(self, "Info", "Non ci sono rettangoli da eliminare.")
             return
 
-        id_to_delete = simpledialog.askstring(
-            "Elimina rettangolo",
-            "Inserisci la lettera del rettangolo da eliminare (es. A, B, AA):"
-        )
-        if id_to_delete is None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Elimina rettangolo")
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("Inserisci la lettera del rettangolo (es. A, B, AA):"))
+        entry = QLineEdit()
+        lay.addWidget(entry)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+
+        if not dlg.exec():
             return
 
-        id_to_delete = id_to_delete.strip().upper()
-        if not id_to_delete:
+        target = entry.text().strip().upper()
+        if not target:
             return
 
-        original_len = len(self.rectangles)
-        self.rectangles = [r for r in self.rectangles if r["label"] != id_to_delete]
+        before = len(self.rectangles)
+        self.rectangles = [r for r in self.rectangles if r["label"] != target]
 
-        if len(self.rectangles) < original_len:
-            messagebox.showinfo("Eliminato", f"Rettangolo {id_to_delete} eliminato.")
+        if len(self.rectangles) < before:
+            QMessageBox.information(self, "Eliminato", f"Rettangolo {target} eliminato.")
         else:
-            messagebox.showwarning("Non trovato", f"Nessun rettangolo con lettera {id_to_delete}.")
+            QMessageBox.warning(self, "Non trovato", f"Nessun rettangolo con lettera {target}.")
 
-        # Aggiorna overlay debug
+        # Ricalcola debug_rects
+        if self.pdf_path:
+            reader = PdfReader(self.pdf_path)
+            page   = reader.pages[0]
+            pw, ph = float(page.mediabox.width), float(page.mediabox.height)
+            self.debug_rects = [
+                (*self._get_rect_pdf_coords(r, pw, ph), r["width"], r["height"])
+                for r in self.rectangles
+            ]
+
+        self._update_preview()
+
+    # ── Genera dima (PDF overlay) ─────────────────────────────────────────────
+
+    def _genera_dima(self, width: float, height: float) -> str:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        c   = canvas.Canvas(tmp.name, pagesize=(width, height))
         self.debug_rects = []
-        reader = PdfReader(self.pdf_path)
-        page = reader.pages[0]
-        pw = float(page.mediabox.width)
-        ph = float(page.mediabox.height)
-
-        for r in self.rectangles:
-            x, y = self.get_rect_pdf_coords(r, pw, ph)
-            self.debug_rects.append((x, y, r["width"], r["height"]))
-
-        self.update_preview()
-
-    # ---------------------------------------------------------
-    # GENERA DIMA (PDF con rettangoli e pattern)
-    # ---------------------------------------------------------
-    def genera_dima(self, width, height):
-        temp_dima = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        c = canvas.Canvas(temp_dima.name, pagesize=(width, height))
-
-        self.debug_rects = []  # reset overlay rettangoli
 
         for r in self.rectangles:
             color = COLOR_MAP.get(r["color"], red)
             c.setStrokeColor(color)
             c.setLineWidth(1)
 
-            # Coordinate PDF
-            x, y = self.get_rect_pdf_coords(r, width, height)
-
-            # Salva per overlay debug
+            x, y = self._get_rect_pdf_coords(r, width, height)
             self.debug_rects.append((x, y, r["width"], r["height"]))
 
-            # Riempimento puntinato
-            if r.get("fill_soft", False):
-                self.draw_dotted_pattern(c, x, y, r["width"], r["height"], color)
+            # Fill puntinato se richiesto
+            if r.get("fill_soft"):
+                self._draw_dotted(c, x, y, r["width"], r["height"], color)
 
-            # Bordo
-            c.setStrokeColor(color)
             c.rect(x, y, r["width"], r["height"], fill=0, stroke=1)
 
             # Testo descrittivo
             c.setFillColor(color)
             c.setFont("Helvetica", 10)
-
             main_text = f"{r['label']} - {r['width_mm']:.0f} mm x {r['height_mm']:.0f} mm"
+            pos1 = f"{r['vert_value_mm']:.0f} mm {'dall\'alto' if r['vert_side']=='top' else 'dal basso'}"
+            pos2 = f"{r['horiz_value_mm']:.0f} mm {'da sinistra' if r['horiz_side']=='left' else 'da destra'}"
 
-            vert_label = "dall'alto" if r["vert_side"] == "top" else "dal basso"
-            horiz_label = "da sinistra" if r["horiz_side"] == "left" else "da destra"
-
-            pos_text_1 = f"{r['vert_value_mm']:.0f} mm {vert_label}"
-            pos_text_2 = f"{r['horiz_value_mm']:.0f} mm {horiz_label}"
-
-            # Posizione testo
             if r["text_position"] == "left":
-                text_x = x + 2
+                tx = x + 2
             else:
-                max_len = max(len(main_text), len(pos_text_1), len(pos_text_2))
-                approx_width = max_len * 4
-                text_x = x + r["width"] - approx_width - 2
+                tx = x + r["width"] - max(len(main_text), len(pos1), len(pos2)) * 4 - 2
 
-            # Disegna testo
-            c.drawString(text_x, y + 4, pos_text_2)
-            c.drawString(text_x, y + 16, pos_text_1)
-            c.drawString(text_x, y + 28, main_text)
-
+            c.drawString(tx, y + 4,  pos2)
+            c.drawString(tx, y + 16, pos1)
+            c.drawString(tx, y + 28, main_text)
             c.setFillColorRGB(0, 0, 0)
 
         c.save()
-        return temp_dima.name
-            # ---------------------------------------------------------
-    # AGGIORNA ANTEPRIMA PDF
-    # ---------------------------------------------------------
-    def update_preview(self):
+        return tmp.name
+
+    def _draw_dotted(self, c, x, y, w, h, color):
+        c.saveState()
+        c.setFillColor(color)
+        step, dot = 6, 1
+        xx = x
+        while xx < x + w:
+            yy = y
+            while yy < y + h:
+                c.circle(xx, yy, dot, fill=1, stroke=0)
+                yy += step
+            xx += step
+        c.restoreState()
+
+    # ── Anteprima ────────────────────────────────────────────────────────────
+
+    def _update_preview(self):
         if not self.pdf_path:
+            return
+
+        try:
+            from pdf2image import convert_from_path
+        except ImportError:
+            QMessageBox.critical(self, "Errore", "pdf2image non installato.\npip install pdf2image")
             return
 
         reader = PdfReader(self.pdf_path)
-        page = reader.pages[0]
-        width = float(page.mediabox.width)
-        height = float(page.mediabox.height)
+        page   = reader.pages[0]
+        w      = float(page.mediabox.width)
+        h      = float(page.mediabox.height)
 
-        # Se non ci sono rettangoli → mostra solo il PDF originale
-        if not self.rectangles:
-            temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        if self.rectangles:
+            dima_path = self._genera_dima(w, h)
+            writer    = PdfWriter()
+            page_copy = reader.pages[0]
+            page_copy.merge_page(PdfReader(dima_path).pages[0])
+            writer.add_page(page_copy)
+        else:
             writer = PdfWriter()
             writer.add_page(page)
 
-            with open(temp_output.name, "wb") as f:
-                writer.write(f)
+        tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        with open(tmp_out.name, "wb") as f:
+            writer.write(f)
 
-            img = convert_from_path(temp_output.name, dpi=120)[0]
-
-        else:
-            # Genera dima con rettangoli
-            dima_pdf = self.genera_dima(width, height)
-
-            temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-            writer = PdfWriter()
-            page_copy = reader.pages[0]
-            dima_page = PdfReader(dima_pdf).pages[0]
-            page_copy.merge_page(dima_page)
-            writer.add_page(page_copy)
-
-            with open(temp_output.name, "wb") as f:
-                writer.write(f)
-
-            img = convert_from_path(temp_output.name, dpi=120)[0]
-
-        self.current_image = img
-        self.redraw_image()
-
-    # ---------------------------------------------------------
-    # REDISEGNA IMMAGINE (applica zoom + overlay)
-    # ---------------------------------------------------------
-    def redraw_image(self):
-        if self.current_image is None:
+        images = convert_from_path(tmp_out.name, dpi=120)
+        if not images:
             return
 
-        w, h = self.current_image.size
-        new_size = (int(w * self.zoom), int(h * self.zoom))
-        resized = self.current_image.resize(new_size, Image.LANCZOS)
+        img = images[0]
+        data = img.tobytes("raw", "RGB")
+        qi   = QImage(data, img.width, img.height, img.width * 3, QImage.Format_RGB888)
+        pm   = QPixmap.fromImage(qi)
 
-        self.tk_image = ImageTk.PhotoImage(resized)
+        if self.debug_overlay:
+            pm = self._draw_debug_overlay(pm, w, h, img.width, img.height)
 
-        self.canvas.delete("all")
-        self.image_id = self.canvas.create_image(0, 0, anchor="nw", image=self.tk_image)
-        self.canvas.config(scrollregion=self.canvas.bbox(ALL))
+        self._canvas.set_pixmap(pm)
 
-        # 🔥 Disegna overlay debug
-        self.draw_debug_overlay()
+    def _draw_debug_overlay(self, pm: QPixmap, pdf_w: float, pdf_h: float,
+                             img_w: int, img_h: int) -> QPixmap:
+        sx = img_w / pdf_w
+        sy = img_h / pdf_h
+        painter = QPainter(pm)
+        painter.setPen(QPen(QColor("red"), 4))
+        for pt in self.debug_points:
+            painter.drawEllipse(int(pt["x"] * sx) - 3, int((pdf_h - pt["y"]) * sy) - 3, 6, 6)
+        painter.setPen(QPen(QColor("blue"), 2))
+        for rx, ry, rw, rh in self.debug_rects:
+            painter.drawRect(int(rx * sx), int((pdf_h - ry - rh) * sy),
+                             int(rw * sx), int(rh * sy))
+        painter.end()
+        return pm
 
-    # ---------------------------------------------------------
-    # ZOOM
-    # ---------------------------------------------------------
-    def on_zoom(self, event):
-        if event.delta > 0 or getattr(event, "num", None) == 4:
-            self.zoom *= 1.1
-        else:
-            self.zoom /= 1.1
+    def toggle_debug(self):
+        self.debug_overlay = not self.debug_overlay
+        self._update_preview()
 
-        self.zoom = max(0.2, min(self.zoom, 5.0))
-        self.redraw_image()
+    # ── Esporta PDF ───────────────────────────────────────────────────────────
 
-    # ---------------------------------------------------------
-    # PAN
-    # ---------------------------------------------------------
-    def start_pan(self, event):
-        self.pan_start = (event.x, event.y)
-
-    def do_pan(self, event):
-        if self.pan_start and self.image_id is not None:
-            dx = event.x - self.pan_start[0]
-            dy = event.y - self.pan_start[1]
-            self.canvas.move(self.image_id, dx, dy)
-
-            # Muove anche l’overlay
-            for item in self.canvas.find_withtag("debug"):
-                self.canvas.move(item, dx, dy)
-
-            self.pan_start = (event.x, event.y)
-                # ---------------------------------------------------------
-    # ESPORTA PDF FINALE
-    # ---------------------------------------------------------
     def export_pdf(self):
         if not self.pdf_path:
+            QMessageBox.warning(self, "Attenzione", "Carica prima un PDF.")
             return
 
-        save_path = filedialog.asksaveasfilename(defaultextension=".pdf")
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Salva PDF", "", "PDF files (*.pdf)"
+        )
         if not save_path:
             return
 
@@ -768,39 +643,28 @@ class DimaWizardApp:
         writer = PdfWriter()
 
         for page in reader.pages:
-            width = float(page.mediabox.width)
-            height = float(page.mediabox.height)
-
-            # Genera la dima per questa pagina
-            dima_pdf = self.genera_dima(width, height)
+            w = float(page.mediabox.width)
+            h = float(page.mediabox.height)
+            dima_pdf  = self._genera_dima(w, h)
             dima_page = PdfReader(dima_pdf).pages[0]
-
-            # Unisci dima + pagina originale
             page.merge_page(dima_page)
             writer.add_page(page)
 
         with open(save_path, "wb") as f:
             writer.write(f)
 
-        messagebox.showinfo("Esportazione completata", "PDF esportato con successo!")
-            # ---------------------------------------------------------
-    # TOGGLE DEBUG OVERLAY (attiva/disattiva)
-    # ---------------------------------------------------------
-    def toggle_debug(self):
-        self.debug_overlay = not self.debug_overlay
+        QMessageBox.information(self, "Completato", "PDF esportato con successo!")
 
-        if not self.debug_overlay:
-            # Cancella overlay quando disattivato
-            self.canvas.delete("debug")
 
-        # Aggiorna anteprima
-        self.update_preview()
-        # ---------------------------------------------------------
-# AVVIO APP
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Avvio
+# ---------------------------------------------------------------------------
+
+def main():
+    app = QApplication(sys.argv)
+    window = DimaWizardApp()
+    window.show()
+    sys.exit(app.exec())
+
 if __name__ == "__main__":
-    root = Tk()
-    app = DimaWizardApp(root)
-    root.mainloop()
-        
-        
+    main()
