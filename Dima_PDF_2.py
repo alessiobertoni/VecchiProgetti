@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QFormLayout, QCheckBox, QFrame,
 )
 
+import fitz  # PyMuPDF
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import red, blue, green, black
 from pypdf import PdfReader, PdfWriter
@@ -568,16 +569,14 @@ class DimaWizardApp(QMainWindow):
         if not self.pdf_path:
             return
 
-        try:
-            from pdf2image import convert_from_path
-        except ImportError:
-            QMessageBox.critical(self, "Errore", "pdf2image non installato.\npip install pdf2image")
-            return
+        # Leggi dimensioni pagina con fitz
+        doc_src = fitz.open(self.pdf_path)
+        page0   = doc_src[0]
+        w       = page0.rect.width
+        h       = page0.rect.height
+        doc_src.close()
 
         reader = PdfReader(self.pdf_path)
-        page   = reader.pages[0]
-        w      = float(page.mediabox.width)
-        h      = float(page.mediabox.height)
 
         if self.rectangles:
             dima_path = self._genera_dima(w, h)
@@ -587,23 +586,23 @@ class DimaWizardApp(QMainWindow):
             writer.add_page(page_copy)
         else:
             writer = PdfWriter()
-            writer.add_page(page)
+            writer.add_page(reader.pages[0])
 
         tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         with open(tmp_out.name, "wb") as f:
             writer.write(f)
 
-        images = convert_from_path(tmp_out.name, dpi=120)
-        if not images:
-            return
+        # Rendering con fitz (nessun Poppler necessario)
+        doc  = fitz.open(tmp_out.name)
+        mat  = fitz.Matrix(120 / 72, 120 / 72)   # ~120 DPI
+        pix  = doc[0].get_pixmap(matrix=mat, alpha=False)
+        doc.close()
 
-        img = images[0]
-        data = img.tobytes("raw", "RGB")
-        qi   = QImage(data, img.width, img.height, img.width * 3, QImage.Format_RGB888)
-        pm   = QPixmap.fromImage(qi)
+        qi = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
+        pm = QPixmap.fromImage(qi)
 
         if self.debug_overlay:
-            pm = self._draw_debug_overlay(pm, w, h, img.width, img.height)
+            pm = self._draw_debug_overlay(pm, w, h, pix.width, pix.height)
 
         self._canvas.set_pixmap(pm)
 

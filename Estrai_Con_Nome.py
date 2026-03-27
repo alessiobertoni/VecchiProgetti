@@ -1,51 +1,15 @@
-import json
-import os
 import sys
 from pathlib import Path
 from typing import Optional
 
+import fitz  # PyMuPDF
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap, QImage
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QMessageBox,
     QFormLayout, QFrame,
 )
-
-CONFIG_FILE = Path(__file__).parent / "config.json"
-
-
-# ---------------------------------------------------------------------------
-# Config Poppler
-# ---------------------------------------------------------------------------
-
-def load_config() -> dict:
-    if CONFIG_FILE.exists():
-        try:
-            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
-
-
-def save_config(data: dict):
-    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
-
-
-def ask_poppler_path(parent) -> Optional[str]:
-    QMessageBox.information(
-        parent,
-        "Percorso Poppler",
-        "Seleziona la cartella 'bin' di Poppler.\n\nEsempio: C:/poppler/Library/bin",
-    )
-    path = QFileDialog.getExistingDirectory(parent, "Seleziona cartella bin di Poppler")
-    if not path:
-        QMessageBox.warning(parent, "Annullato", "Percorso Poppler non configurato.")
-        return None
-    if not os.path.exists(os.path.join(path, "pdftoppm.exe")):
-        QMessageBox.critical(parent, "Errore", "La cartella selezionata NON contiene pdftoppm.exe")
-        return None
-    return path
 
 
 # ---------------------------------------------------------------------------
@@ -59,29 +23,8 @@ class PdfSplitterWindow(QMainWindow):
         self.setMinimumWidth(500)
 
         self.pdf_path: Optional[str] = None
-        self.poppler_path: Optional[str] = None
 
-        self._setup_poppler()
         self._build_ui()
-
-    # ── Configurazione Poppler ───────────────────────────────────────────────
-
-    def _setup_poppler(self):
-        config = load_config()
-        path   = config.get("poppler_path")
-
-        if path and os.path.exists(path):
-            self.poppler_path = path
-            return
-
-        path = ask_poppler_path(self)
-        if not path:
-            QMessageBox.critical(self, "Errore", "Impossibile avviare senza Poppler.")
-            sys.exit(1)
-
-        self.poppler_path = path
-        config["poppler_path"] = path
-        save_config(config)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -134,24 +77,22 @@ class PdfSplitterWindow(QMainWindow):
         self.pdf_path = path
 
         try:
-            from pdf2image import convert_from_path
-            pages = convert_from_path(
-                path, first_page=1, last_page=1,
-                poppler_path=self.poppler_path,
-            )
-            img = pages[0].convert("RGB")
-            img.thumbnail((400, 400))
-            if img.width < 50 or img.height < 50:
-                img = img.resize((300, 300))
+            doc = fitz.open(path)
+            mat = fitz.Matrix(120 / 72, 120 / 72)   # ~120 DPI
+            pix = doc[0].get_pixmap(matrix=mat, alpha=False)
+            doc.close()
 
-            data = img.tobytes("raw", "RGB")
-            qi   = QImage(data, img.width, img.height, img.width * 3, QImage.Format_RGB888)
-            pm   = QPixmap.fromImage(qi)
+            qi = QImage(pix.samples, pix.width, pix.height,
+                        pix.stride, QImage.Format_RGB888).copy()
+            pm = QPixmap.fromImage(qi).scaled(
+                400, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
             self.preview.setPixmap(pm)
             self.preview.setText("")
 
         except Exception as e:
-            QMessageBox.critical(self, "Errore anteprima", f"Impossibile caricare l'anteprima:\n{e}")
+            QMessageBox.critical(self, "Errore anteprima",
+                                 f"Impossibile caricare l'anteprima:\n{e}")
 
     # ── Split PDF ──────────────────────────────────────────────────────────────
 
